@@ -102,7 +102,7 @@ function setPose(pose) {
     if (wb) st = { x: wb.x + 64, y: wb.y + 8, dir: "west", present: true, label: "at the whiteboard" };
   } else if (pose === "meeting") {
     const bt = CONFIG.props.find((p) => p.id === "booth");
-    if (bt) st = { x: bt.x, y: bt.y - 46, dir: "north", label: "in a meeting" };
+    if (bt) st = { x: bt.x, y: bt.y + 12, dir: "north", label: "in a meeting" };
   }
   actor.pose = pose;
   actor.seated = st.seated === true;
