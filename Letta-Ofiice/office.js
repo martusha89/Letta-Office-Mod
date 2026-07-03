@@ -1,11 +1,11 @@
-// Letta Ofiice renderer (rebuilt).
-// The room is composed from separate sprites on a drawn floor, so Cameron is
-// y-sorted among the furniture by his feet: he walks in front of things below
-// him and behind things above him, and sits properly at the desk. No baked-in
-// room image, no occlusion hacks.
+// Letta Ofiice renderer (multiplayer).
+// The room is composed from separate sprites on a drawn floor, and every agent
+// in the harness is a body in the office, y-sorted among the furniture and
+// each other by their feet. Agents walk in through the right side when they
+// appear, take a free slot at their station, and walk out when they finish.
 //
-// Pose is driven by window.setPose(name) / window.say(text). With no external
-// driver it runs a demo loop so the office is alive on its own.
+// Live state arrives over SSE as a roster of agents. With no external driver
+// it runs a small demo cast so the office is alive on its own.
 //
 // Tunables live in CONFIG. Positions are in the 800x600 canvas space.
 
@@ -20,9 +20,10 @@ const CONFIG = {
   walkFrames: 6,
   frameMs: 130,
   glideSpeed: 2.2,
+  maxActors: 12,          // visible bodies; beyond this the HUD shows "+N"
 
   // furniture: each sprite is placed by its base point (x, y = where it meets
-  // the floor). baseY is used for depth sorting against Cameron's feet.
+  // the floor). baseY is used for depth sorting against the actors' feet.
   props: [
     { id: "rug",       asset: "./assets/props/rug.png",       x: 694, y: 490, scale: 2.25, flat: true },
     { id: "bookshelf", asset: "./assets/props/bookshelf.png", x: 243, y: 266, scale: 1.2 },
@@ -36,7 +37,7 @@ const CONFIG = {
     { id: "booth",     asset: "./assets/props/booth.png",     x: 696, y: 570, scale: 1.65 },
   ],
 
-  // Cameron's spot per activity. `seated` swaps to the typing (back-view) anim.
+  // Where each activity happens. `seated` swaps to the typing (back-view) anim.
   stations: {
     idle:  { x: 400, y: 486, dir: "south",      label: "settled in" },
     think: { x: 400, y: 470, dir: "south",      label: "thinking" },
@@ -54,6 +55,13 @@ const CONFIG = {
 const DIRS8 = ["south", "east", "north", "west", "south-east", "north-east", "north-west", "south-west"];
 const WALK_DIRS = DIRS8;
 
+// where new agents appear from and leave through (right edge of the floor)
+const DOOR = { x: 786, y: 500 };
+// extra bodies at the same station stand beside the first, not inside it
+const STATION_SLOTS = [[0, 0], [-48, 16], [48, 16], [-94, 28], [94, 28], [0, 42], [-140, 42], [140, 42]];
+// hue rotations for the tinted stock cast (agents without a forged body)
+const TINT_HUES = [150, 285, 60, 210, 330, 105, 245, 25];
+
 const canvas = document.getElementById("room");
 const ctx = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
@@ -70,15 +78,15 @@ function loadImage(src) {
   });
 }
 
-const assets = { idle: {}, walk: {}, sit: {}, present: {}, props: {} };
+const assets = { props: {} };
 
-// ── characters ──
-// assets/characters.json (written by the mod's sprite forge) lists installed
-// characters; agent-forged ones live in assets/characters/<slug>/ with a
-// meta.json carrying their scale so everyone stands Cameron-height. With no
-// manifest (plain file:// open, fresh install) Cameron loads from his
-// original paths.
-const CHARACTER = { slug: "cameron", loading: null };
+// ── character sets ──
+// charCache maps a slug to {idle, walk, sit, present, meta}. "cameron" is the
+// built-in; forged characters (assets/characters/<slug>/, written by the mod's
+// sprite forge) load from their manifest entry; "~tint:N" sets are hue-rotated
+// copies of Cameron for agents without a body of their own.
+const charCache = new Map();
+let manifestCache = null;
 
 async function fetchJson(url) {
   try {
@@ -98,7 +106,7 @@ function cameronPaths() {
 }
 
 async function characterPaths(slug) {
-  const manifest = await fetchJson("./assets/characters.json");
+  const manifest = manifestCache || (manifestCache = await fetchJson("./assets/characters.json"));
   const entry = manifest?.characters?.[slug];
   if (!entry || entry.builtin) return { slug: entry ? slug : "cameron", ...cameronPaths() };
   const base = `./assets/${entry.dir}`;
@@ -119,50 +127,159 @@ async function characterPaths(slug) {
   };
 }
 
-async function loadCharacter(slug) {
-  const P = await characterPaths(slug);
-  const next = { idle: {}, walk: {}, sit: {}, present: {} };
-  await Promise.all(DIRS8.map(async (d) => { next.idle[d] = await loadImage(P.idle(d)); }));
+// PixelLab sprites float in a padded canvas (a 120px sheet holds roughly 60px
+// of character), and the padding varies between characters and poses. Measure
+// the opaque pixels once per charset and render by visible content, so every
+// character stands the same height with their feet actually on the floor.
+function measureContent(img) {
+  try {
+    const c = document.createElement("canvas");
+    c.width = img.width; c.height = img.height;
+    const g = c.getContext("2d");
+    g.drawImage(img, 0, 0);
+    const data = g.getImageData(0, 0, c.width, c.height).data;
+    let top = -1, bottom = -1;
+    for (let y = 0; y < c.height; y++) {
+      for (let x = 0; x < c.width; x++) {
+        if (data[(y * c.width + x) * 4 + 3] > 12) {
+          if (top < 0) top = y;
+          bottom = y;
+          break;
+        }
+      }
+    }
+    if (top < 0) return null;
+    return { topRatio: top / img.height, bottomRatio: (bottom + 1) / img.height, hRatio: (bottom + 1 - top) / img.height };
+  } catch (e) {
+    return null; // tainted canvas on file://; use the standard PixelLab padding
+  }
+}
+const DEFAULT_METRICS = { topRatio: 0.25, bottomRatio: 0.78, hRatio: 0.53 };
+
+async function loadCharsetFromPaths(P) {
+  const set = { idle: {}, walk: {}, sit: {}, present: {}, meta: P.meta };
+  await Promise.all(DIRS8.map(async (d) => { set.idle[d] = await loadImage(P.idle(d)); }));
   await Promise.all(WALK_DIRS.map(async (d) => {
     const frames = await Promise.all(
       Array.from({ length: P.meta.walkFrames }, (_, i) => loadImage(P.walk(d, i))),
     );
-    next.walk[d] = frames.filter(Boolean); // missing frames fall back to idle glide
+    set.walk[d] = frames.filter(Boolean); // missing frames fall back to idle glide
   }));
-  await Promise.all(DIRS8.map(async (d) => { next.sit[d] = await loadImage(P.sit(d)); }));
-  await Promise.all(DIRS8.map(async (d) => { next.present[d] = await loadImage(P.present(d)); }));
-  Object.assign(assets, { idle: next.idle, walk: next.walk, sit: next.sit, present: next.present });
-  CONFIG.charScale = P.meta.scale;
-  CONFIG.sitScale = P.meta.sitScale;
-  CONFIG.feetAnchor = P.meta.feetAnchor;
-  CONFIG.sitFeetAnchor = P.meta.sitFeetAnchor;
-  CHARACTER.slug = P.slug;
+  await Promise.all(DIRS8.map(async (d) => { set.sit[d] = await loadImage(P.sit(d)); }));
+  await Promise.all(DIRS8.map(async (d) => { set.present[d] = await loadImage(P.present(d)); }));
+  const standRef = set.idle.south || set.idle[DIRS8.find((d) => set.idle[d])];
+  const sitRef = set.sit.south || set.sit["north-west"] || set.sit[DIRS8.find((d) => set.sit[d])];
+  set.metrics = {
+    stand: (standRef && measureContent(standRef)) || DEFAULT_METRICS,
+    sit: (sitRef && measureContent(sitRef)) || DEFAULT_METRICS,
+  };
+  return set;
 }
 
-function switchCharacter(slug) {
-  if (!slug || slug === CHARACTER.slug || CHARACTER.loading) return;
-  CHARACTER.loading = loadCharacter(slug).finally(() => { CHARACTER.loading = null; });
+function tintImage(img, hue) {
+  if (!img) return null;
+  const c = document.createElement("canvas");
+  c.width = img.width;
+  c.height = img.height;
+  const g = c.getContext("2d");
+  g.imageSmoothingEnabled = false;
+  g.filter = `hue-rotate(${hue}deg) saturate(0.92)`;
+  g.drawImage(img, 0, 0);
+  return c;
 }
 
-async function loadAssets() {
-  const manifest = await fetchJson("./assets/characters.json");
-  await loadCharacter(manifest?.active || "cameron");
-  await Promise.all(CONFIG.props.map(async (p) => { assets.props[p.id] = await loadImage(p.asset); }));
+function tintCharset(source, hue) {
+  const set = { idle: {}, walk: {}, sit: {}, present: {}, meta: source.meta, metrics: source.metrics };
+  for (const d of DIRS8) {
+    set.idle[d] = tintImage(source.idle[d], hue);
+    set.sit[d] = tintImage(source.sit[d], hue);
+    set.present[d] = tintImage(source.present[d], hue);
+    set.walk[d] = (source.walk[d] || []).map((f) => tintImage(f, hue));
+  }
+  return set;
 }
 
-const actor = {
-  x: CONFIG.stations.idle.x, y: CONFIG.stations.idle.y, dir: "south",
-  target: { ...CONFIG.stations.idle },
-  pose: "idle", seated: false, present: false, moving: false, frame: 0, lastFrame: 0, path: [],
-};
+function hashCode(s) {
+  let h = 0;
+  for (let i = 0; i < String(s).length; i++) h = (h * 31 + String(s).charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
 
-function setPose(pose) {
+function tintSlugFor(id) {
+  return `~tint:${TINT_HUES[hashCode(id) % TINT_HUES.length]}`;
+}
+
+async function ensureCharset(slug) {
+  if (charCache.has(slug)) return charCache.get(slug);
+  let set;
+  if (slug.startsWith("~tint:")) {
+    const cameron = await ensureCharset("cameron");
+    set = tintCharset(cameron, Number(slug.slice(6)) || 150);
+  } else {
+    set = await loadCharsetFromPaths(await characterPaths(slug));
+    if (!set.idle.south && slug !== "cameron") set = await ensureCharset("cameron");
+  }
+  charCache.set(slug, set);
+  return set;
+}
+
+function charsetOf(actor) {
+  return charCache.get(actor.slug) || charCache.get("cameron");
+}
+
+// ── actors ──
+const actors = new Map();
+let primaryActorId = "local";
+
+function primaryActor() {
+  return actors.get(primaryActorId) || actors.values().next().value || null;
+}
+
+function spawnActor(id, name, slug, { atDoor = true } = {}) {
+  const start = atDoor ? { ...DOOR } : { x: CONFIG.stations.idle.x, y: CONFIG.stations.idle.y };
+  const actor = {
+    id, name: name || id, slug: slug || "cameron",
+    x: start.x, y: start.y, dir: "west",
+    pose: "idle", seated: false, present: false, moving: false,
+    frame: 0, lastFrame: 0, path: [],
+    target: { x: start.x, y: start.y, dir: "south" },
+    bubbles: [], lastBubble: null, leaving: false, leaveStarted: 0,
+  };
+  actors.set(id, actor);
+  ensureCharset(actor.slug); // warm the cache; falls back to Cameron until ready
+  return actor;
+}
+
+function beginLeave(actor) {
+  if (actor.leaving) return;
+  actor.leaving = true;
+  actor.leaveStarted = performance.now();
+  actor.seated = false;
+  actor.present = false;
+  actor.target = { x: DOOR.x, y: DOOR.y, dir: "east" };
+  actor.path = findPath(actor.x, actor.y, DOOR.x, DOOR.y, null);
+}
+
+function slotIndexFor(pose, self) {
+  let index = 0;
+  for (const other of actors.values()) {
+    if (other === self || other.leaving) continue;
+    if (other.pose === pose) index += 1;
+  }
+  return Math.min(index, STATION_SLOTS.length - 1);
+}
+
+function setPoseFor(actor, pose) {
+  if (!actor || actor.leaving) return;
   let st = CONFIG.stations[pose] || CONFIG.stations.idle;
-  // desk/present/meeting spots follow their furniture, so moving the prop in the
-  // editor moves Cameron's spot with it (and keeps the desk occluding his legs).
+  // desk/present/meeting spots follow their furniture, so moving the prop in
+  // the editor moves the actor's spot with it (and keeps the desk occluding
+  // the sitter's legs).
   if (pose === "desk" || pose === "shell") {
     const dk = CONFIG.props.find((p) => p.id === "desk");
-    if (dk) st = { x: dk.x, y: dk.y - 6, dir: "north-west", seated: true, label: (CONFIG.stations[pose] || {}).label };
+    // seated on his own chair in FRONT of the desk (south side), back to the
+    // camera, facing the monitor; y past the desk base so he draws over it
+    if (dk) st = { x: dk.x - 8, y: dk.y + 34, dir: "north", seated: true, label: (CONFIG.stations[pose] || {}).label };
   } else if (pose === "present") {
     const wb = CONFIG.props.find((p) => p.id === "whiteboard");
     if (wb) st = { x: wb.x + 64, y: wb.y + 8, dir: "west", present: true, label: "at the whiteboard" };
@@ -170,14 +287,28 @@ function setPose(pose) {
     const bt = CONFIG.props.find((p) => p.id === "booth");
     if (bt) st = { x: bt.x, y: bt.y + 12, dir: "north", label: "in a meeting" };
   }
+  const slot = slotIndexFor(pose, actor);
+  const [ox, oy] = STATION_SLOTS[slot];
+  const seated = slot === 0 && st.seated === true;      // only the first body gets the chair
+  const present = slot === 0 && st.present === true;
+  const tx = Math.max(30, Math.min(770, st.x + ox));
+  const ty = Math.max(WY_MIN, Math.min(WY_MAX, st.y + oy));
   actor.pose = pose;
-  actor.seated = st.seated === true;
-  actor.present = st.present === true;
-  actor.target = { x: st.x, y: st.y, dir: st.dir };
-  actor.path = findPath(actor.x, actor.y, st.x, st.y, EXCLUDE[pose] || null);
-  if (statusEl) statusEl.textContent = st.label || pose;
+  actor.seated = seated;
+  actor.present = present;
+  actor.target = { x: tx, y: ty, dir: st.dir };
+  actor.path = findPath(actor.x, actor.y, tx, ty, EXCLUDE[pose] || null);
+  if (actor.id === primaryActorId && statusEl && !editMode) statusEl.textContent = st.label || pose;
+}
+
+// window API kept for the demo loop and any external driver
+function setPose(pose) {
+  const actor = primaryActor();
+  if (actor) setPoseFor(actor, pose);
 }
 window.setPose = setPose;
+// debug handle for poking the office from the console
+window.__office = { actors, charCache, CONFIG, get primaryActorId() { return primaryActorId; } };
 
 function walkDirFor(dx, dy) {
   const ang = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
@@ -185,9 +316,9 @@ function walkDirFor(dx, dy) {
   return dirs[Math.round(ang / 45) % 8];
 }
 
-// ── walk routing: keep Cameron off furniture footprints and route around them ──
+// ── walk routing: keep actors off furniture footprints and route around them ──
 const CELL = 20;
-const WY_MIN = 298, WY_MAX = 576;       // walkable floor band (Cameron's feet)
+const WY_MIN = 298, WY_MAX = 576;       // walkable floor band (the actors' feet)
 const EXCLUDE = { desk: "desk", shell: "desk", present: "whiteboard", meeting: "booth" };
 
 function footprints(excludeId) {
@@ -202,7 +333,7 @@ function footprints(excludeId) {
 }
 function inFoot(x, y, f) { const dx = (x - f.cx) / f.rx, dy = (y - f.cy) / f.ry; return dx * dx + dy * dy <= 1; }
 function isBlocked(x, y, foots) {
-  if (x < 24 || x > 776 || y < WY_MIN || y > WY_MAX) return true;
+  if (x < 24 || x > 790 || y < WY_MIN || y > WY_MAX) return true;
   for (const f of foots) if (inFoot(x, y, f)) return true;
   return false;
 }
@@ -250,7 +381,7 @@ function findPath(sx, sy, tx, ty, excludeId) {
   return out;
 }
 
-function update(now) {
+function updateActor(actor, now) {
   const wp = actor.path && actor.path[0];
   if (wp) {
     const dx = wp.x - actor.x, dy = wp.y - actor.y, dist = Math.hypot(dx, dy);
@@ -269,6 +400,16 @@ function update(now) {
   }
   if (actor.moving && now - actor.lastFrame > CONFIG.frameMs) { actor.frame += 1; actor.lastFrame = now; }
   if (!actor.moving) actor.frame = 0;
+}
+
+function updateActors(now) {
+  for (const [id, actor] of [...actors]) {
+    updateActor(actor, now);
+    if (actor.leaving) {
+      const atDoor = Math.hypot(actor.x - DOOR.x, actor.y - DOOR.y) < 8;
+      if (atDoor || now - actor.leaveStarted > 8000) actors.delete(id);
+    }
+  }
 }
 
 // ── room shell ──
@@ -342,63 +483,94 @@ function drawProp(p) {
   ctx.drawImage(img, left, top, w, h);
 }
 
-function currentSprite() {
+// how tall the visible character is on screen, in canvas px. Sitting is drawn
+// larger so head and shoulders clear the desktop instead of vanishing behind it.
+const VISIBLE_HEIGHT = { stand: 126, sit: 138 };
+
+function currentSpriteFor(actor) {
+  const set = charsetOf(actor);
+  if (!set) return { img: null, mode: "stand", set: null };
   if (actor.seated && !actor.moving) {
-    const img = assets.sit[actor.dir] || assets.sit["north-west"] || assets.sit.north;
-    if (img) return { img, anchor: CONFIG.sitFeetAnchor, scale: CONFIG.sitScale };
+    const img = set.sit[actor.dir] || set.sit["north-west"] || set.sit.north;
+    if (img) return { img, mode: "sit", set };
   }
   if (actor.present && !actor.moving) {
-    const img = assets.present[actor.dir] || assets.present.west || assets.present.south;
-    if (img) return { img, anchor: CONFIG.feetAnchor, scale: CONFIG.charScale };
+    const img = set.present[actor.dir] || set.present.west || set.present.south;
+    if (img) return { img, mode: "stand", set };
   }
   if (actor.moving) {
-    const f = assets.walk[actor.dir];
-    if (f && f.length) return { img: f[actor.frame % f.length], anchor: CONFIG.feetAnchor, scale: CONFIG.charScale };
+    const f = set.walk[actor.dir];
+    if (f && f.length) return { img: f[actor.frame % f.length], mode: "stand", set };
   }
-  return { img: assets.idle[actor.dir] || assets.idle.south, anchor: CONFIG.feetAnchor, scale: CONFIG.charScale };
+  return { img: set.idle[actor.dir] || set.idle.south, mode: "stand", set };
 }
 
-function drawCameron() {
-  const { img, anchor, scale } = currentSprite();
+function drawActor(actor) {
+  const { img, mode, set } = currentSpriteFor(actor);
   if (!img) return;
+  const metrics = (set && set.metrics && set.metrics[mode]) || DEFAULT_METRICS;
+  const scale = VISIBLE_HEIGHT[mode] / (img.height * metrics.hRatio);
   const w = img.width * scale, h = img.height * scale;
   const left = Math.round(actor.x - w / 2);
-  const top = Math.round(actor.y - h * anchor);
+  const top = Math.round(actor.y - h * metrics.bottomRatio); // visible feet land on actor.y
   ctx.drawImage(img, left, top, w, h);
-  actor._headX = actor.x; actor._headTop = top;
+  actor._headX = actor.x;
+  actor._headTop = top + h * metrics.topRatio;
+}
+
+function drawNamePlate(actor) {
+  const label = String(actor.name || actor.id).slice(0, 16);
+  ctx.save();
+  ctx.font = "10px ui-monospace, monospace";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const w = ctx.measureText(label).width + 10;
+  const x = Math.round(actor.x), y = Math.round(actor.y) + 10;
+  ctx.globalAlpha = 0.82;
+  ctx.fillStyle = "#160d08";
+  ctx.fillRect(Math.round(x - w / 2), y - 7, Math.round(w), 14);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = actor.id === primaryActorId ? "#ffcf6b" : "#e8c9a0";
+  ctx.fillText(label, x, y + 1);
+  ctx.restore();
 }
 
 function drawSorted() {
   for (const p of CONFIG.props) if (p.flat) drawProp(p);
   const items = [];
   for (const p of CONFIG.props) if (!p.flat) items.push({ y: p.y, draw: () => drawProp(p) });
-  items.push({ y: actor.y, draw: drawCameron });
+  for (const actor of actors.values()) items.push({ y: actor.y, draw: () => drawActor(actor) });
   items.sort((a, b) => a.y - b.y);
   for (const it of items) it.draw();
+  // name plates render as an overlay so a desk or booth never hides who is who
+  if (actors.size > 1) {
+    for (const actor of actors.values()) if (!actor.leaving) drawNamePlate(actor);
+  }
 }
 
-// ── speech bubbles ──
-const bubbles = [];
-function say(text, ttl) {
-  bubbles.push({ text: String(text).slice(0, 90), born: performance.now(), ttl: ttl || 3600 });
-  while (bubbles.length > 3) bubbles.shift();
+// ── speech bubbles (per actor) ──
+function sayFor(actor, text, ttl) {
+  if (!actor) return;
+  actor.bubbles.push({ text: String(text).slice(0, 90), born: performance.now(), ttl: ttl || 3600 });
+  while (actor.bubbles.length > 2) actor.bubbles.shift();
 }
+function say(text, ttl) { sayFor(primaryActor(), text, ttl); }
 window.say = say;
 
-function drawBubbles(now) {
+function drawBubblesFor(actor, now) {
+  if (!actor.bubbles.length) return;
   ctx.save();
   ctx.font = "15px ui-monospace, monospace";
   ctx.textAlign = "center"; ctx.textBaseline = "middle";
   let stack = 0;
-  for (let i = bubbles.length - 1; i >= 0; i--) {
-    const b = bubbles[i];
+  for (let i = actor.bubbles.length - 1; i >= 0; i--) {
+    const b = actor.bubbles[i];
     const age = now - b.born;
-    if (age > b.ttl) { bubbles.splice(i, 1); continue; }
+    if (age > b.ttl) { actor.bubbles.splice(i, 1); continue; }
     const fade = age < 130 ? age / 130 : (age > b.ttl - 380 ? Math.max(0, (b.ttl - age) / 380) : 1);
     const padX = 10, h = 26;
     const tw = Math.min(300, ctx.measureText(b.text).width);
     const w = Math.round(tw + padX * 2);
-    const cx = Math.round(actor._headX ?? actor.x);
+    const cx = Math.round(Math.max(60, Math.min(740, actor._headX ?? actor.x)));
     const top = Math.round((actor._headTop ?? actor.y - 140) - 14 - stack - h);
     const left = Math.round(cx - w / 2);
     ctx.globalAlpha = fade;
@@ -410,6 +582,10 @@ function drawBubbles(now) {
     stack += h + 8;
   }
   ctx.restore();
+}
+
+function drawBubbles(now) {
+  for (const actor of actors.values()) drawBubblesFor(actor, now);
 }
 
 // ── furniture editor (press E) ──
@@ -487,7 +663,11 @@ function hitProp(x, y) {
 }
 function updateStatus() {
   if (!statusEl) return;
-  if (!editMode) { statusEl.textContent = (CONFIG.stations[actor.pose] || {}).label || actor.pose; return; }
+  if (!editMode) {
+    const actor = primaryActor();
+    statusEl.textContent = actor ? ((CONFIG.stations[actor.pose] || {}).label || actor.pose) : "empty office";
+    return;
+  }
   statusEl.textContent = selected
     ? `EDIT · ${selected.id}  x:${Math.round(selected.x)} y:${Math.round(selected.y)} scale:${selected.scale.toFixed(2)}  ·  arrows move (shift=10) · +/- size · Del remove · S copy`
     : "EDIT MODE · click a piece · arrows/+/-/Del · S copies layout · E exits";
@@ -548,11 +728,23 @@ window.addEventListener("keydown", (e) => {
   if (handled) { e.preventDefault(); saveLayout(); updateStatus(); }
 });
 
+function drawHudExtras() {
+  const total = actors.size;
+  if (total <= CONFIG.maxActors) return;
+  ctx.save();
+  ctx.font = "12px ui-monospace, monospace";
+  ctx.textAlign = "right"; ctx.textBaseline = "top";
+  ctx.fillStyle = "#ffcf6b";
+  ctx.fillText(`+${total - CONFIG.maxActors} more agents`, 788, 8);
+  ctx.restore();
+}
+
 function loop(now) {
-  update(now);
+  updateActors(now);
   drawRoom();
   drawSorted();
   drawBubbles(now);
+  drawHudExtras();
   if (editMode) {
     ctx.fillStyle = "rgba(0,0,0,0.12)"; ctx.fillRect(0, 0, CONFIG.canvas[0], CONFIG.canvas[1]);
     if (selected) {
@@ -564,7 +756,9 @@ function loop(now) {
   requestAnimationFrame(loop);
 }
 
-// ── demo loop ──
+// ── demo cast ──
+// With no live driver, a small crew keeps the office alive: the primary at
+// his usual rounds, plus two tinted colleagues wandering their own loops.
 const DEMO = [
   ["think", "Typing 'Letta' should be a spiritual experience."],
   ["read", "Looking through the repo..."],
@@ -576,28 +770,92 @@ const DEMO = [
   ["error", "if they fail, it's a teaching moment"],
   ["idle", "I have furniture now. I am unstoppable."],
 ];
+const DEMO_CAST = [
+  { id: "demo-scout", name: "Scout", cycle: ["read", "web", "meeting", "idle", "shell"], lines: ["indexing the shelf...", "the docs lied to me", "syncing up", "five minute break", "borrowing the terminal"] },
+  { id: "demo-rook", name: "Rook", cycle: ["meeting", "idle", "present", "read", "web"], lines: ["booth is mine now", "contemplating the rug", "behold: my diagram", "light reading", "just one more tab"] },
+];
 let demoI = 0, demoTimer = null;
 let live = false;
 function startDemo() {
   const step = () => {
     if (editMode || live) return;
     const [pose, line] = DEMO[demoI % DEMO.length];
-    setPose(pose); say(line, 3800); demoI += 1;
+    setPose(pose); say(line, 3800);
+    for (const [ci, member] of DEMO_CAST.entries()) {
+      let guest = actors.get(member.id);
+      if (!guest) guest = spawnActor(member.id, member.name, tintSlugFor(member.id));
+      const phase = (demoI + ci + 1) % member.cycle.length;
+      setPoseFor(guest, member.cycle[phase]);
+      if ((demoI + ci) % 3 === 0) sayFor(guest, member.lines[phase], 3400);
+    }
+    demoI += 1;
   };
   step();
   demoTimer = setInterval(step, 4400);
 }
 window.stopDemo = () => { clearInterval(demoTimer); demoTimer = null; };
 
-// Sam's harness reports rich stations; map them onto Cameron's spots here.
+// The mod reports stations per agent; map them onto office poses here.
 const SAM_STATION_TO_POSE = {
   rug: "idle", desk: "desk", terminal: "shell", shelf: "read",
   whiteboard: "present", cabinet: "read", door: "ask", meeting: "meeting", gallery: "think",
 };
 
+let rosterSeen = false;
+
+async function applyRosterEntry(agent) {
+  const id = String(agent.id);
+  let actor = actors.get(id);
+  const wantSlug = agent.character || tintSlugFor(id);
+  if (!actor) {
+    await ensureCharset(wantSlug);
+    actor = spawnActor(id, agent.name, wantSlug);
+  } else if (actor.leaving) {
+    actor.leaving = false; // came back before reaching the door
+  }
+  if (agent.name) actor.name = agent.name;
+  if (actor.slug !== wantSlug) {
+    await ensureCharset(wantSlug); // a body was forged mid-session; change into it
+    actor.slug = wantSlug;
+  }
+  if (agent.primary) primaryActorId = id;
+  const pose = SAM_STATION_TO_POSE[agent.station] || "idle";
+  if (actor.pose !== pose || (!actor.path.length && !actor.moving && Math.hypot(actor.x - actor.target.x, actor.y - actor.target.y) > 4)) {
+    setPoseFor(actor, pose);
+  }
+  if (agent.bubble && agent.bubble !== actor.lastBubble) {
+    actor.lastBubble = agent.bubble;
+    sayFor(actor, agent.bubble, 4200);
+  }
+}
+
+async function applyRoster(agents) {
+  // first roster: the boot-time "local" body becomes the real primary agent
+  // instead of walking out while its twin walks in
+  if (!rosterSeen && actors.has("local") && agents.length && !agents.some((a) => String(a.id) === "local")) {
+    const primaryEntry = agents.find((a) => a.primary) || agents[0];
+    const localActor = actors.get("local");
+    actors.delete("local");
+    localActor.id = String(primaryEntry.id);
+    actors.set(localActor.id, localActor);
+    primaryActorId = localActor.id;
+  }
+  rosterSeen = true;
+  const present = new Set();
+  for (const agent of agents.slice(0, CONFIG.maxActors)) {
+    present.add(String(agent.id));
+    await applyRosterEntry(agent);
+  }
+  for (const [id, actor] of actors) {
+    if (!present.has(id) && !actor.leaving) beginLeave(actor);
+  }
+  updateStatus();
+}
+
 // Live link to the Letta mod when served over http; silently stays on the demo
-// loop when opened as a plain file:// with no server. Understands both our own
-// {type:"pose"/"say"} messages and Sam's {type:"state", state:{station,bubble}}.
+// loop when opened as a plain file:// with no server. Understands the roster
+// protocol, our own {type:"pose"/"say"} messages, and the mod's legacy
+// single-agent {type:"state"} messages.
 function connectLive() {
   try {
     const es = new EventSource("events");
@@ -606,17 +864,40 @@ function connectLive() {
       if (m.type === "ping") return;
       if (!live) { live = true; window.stopDemo(); }
       if (editMode) return;
-      if (m.type === "pose") setPose(m.pose);
+      if (m.type === "roster" && Array.isArray(m.agents)) applyRoster(m.agents);
+      else if (m.type === "pose") setPose(m.pose);
       else if (m.type === "say") say(m.text, m.ttl);
       else if (m.type === "init" && m.pose) setPose(m.pose);
-      else if (m.type === "state" && m.state) {
-        if (m.state.character) switchCharacter(m.state.character);
+      else if (m.type === "state" && m.state && !rosterSeen) {
+        // old mod without roster support: drive the primary body only
+        const actor = primaryActor();
+        if (m.state.character && actor && actor.slug !== m.state.character) {
+          ensureCharset(m.state.character).then(() => { actor.slug = m.state.character; });
+        }
         setPose(SAM_STATION_TO_POSE[m.state.station] || "idle");
-        if (m.state.bubble) say(m.state.bubble, 4200);
+        if (m.state.bubble && actor && m.state.bubble !== actor.lastBubble) {
+          actor.lastBubble = m.state.bubble;
+          say(m.state.bubble, 4200);
+        }
       }
     };
     es.onerror = () => {};
   } catch (e) { /* no live driver available */ }
+}
+
+async function loadAssets() {
+  const manifest = await fetchJson("./assets/characters.json");
+  manifestCache = manifest;
+  await ensureCharset("cameron");
+  const activeSlug = manifest?.active && manifest.characters?.[manifest.active] && !manifest.characters[manifest.active].builtin
+    ? manifest.active
+    : "cameron";
+  if (activeSlug !== "cameron") await ensureCharset(activeSlug);
+  await Promise.all(CONFIG.props.map(async (p) => { assets.props[p.id] = await loadImage(p.asset); }));
+  const primaryName = manifest?.characters?.[activeSlug]?.name || "Cameron";
+  const primary = spawnActor("local", primaryName, activeSlug, { atDoor: false });
+  primaryActorId = "local";
+  primary.target = { x: CONFIG.stations.idle.x, y: CONFIG.stations.idle.y, dir: "south" };
 }
 
 loadAssets().then(async () => {

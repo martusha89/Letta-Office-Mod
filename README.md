@@ -1,6 +1,6 @@
 # Letta Office
 
-A tiny pixel office for the [Letta](https://www.letta.com) Code CLI. It opens a browser window with a cozy, furnished office, and a little pixel developer lives inside it, acting out whatever your agent is doing in real time. He sits down at his desk to type when the agent edits or runs a command, wanders off to read, steps up to the whiteboard to present, heads to the booth for a meeting, and frets when a tool errors.
+A tiny pixel office for the [Letta](https://www.letta.com) Code CLI. It opens a browser window with a cozy, furnished office, and your agents live inside it, acting out whatever they are doing in real time. They sit down at the desk to type when editing or running a command, wander off to read, step up to the whiteboard to present, head to the booth for a meeting, and fret when a tool errors. Every agent in the harness gets its own body: subagents and background conversations walk in through the side when they start, work alongside everyone else with a name plate over their head, and walk out when they finish.
 
 ![Letta Office](docs/hero.png)
 
@@ -20,9 +20,22 @@ It is a Letta Code mod. The mod runs a small local server, streams harness activ
 | A tool errors | a flustered "uh oh" |
 | Quiet stretch | settles back, idle |
 
-He is depth-sorted against the furniture, so he passes in front of some pieces and behind others, and he routes around furniture instead of walking over it.
+Everyone is depth-sorted against the furniture and each other, so they pass in front of some pieces and behind others, and they route around furniture instead of walking over it.
 
 ![At the desk](docs/at-desk.png)
+
+## Multiplayer: every agent gets a body
+
+The office holds the whole harness, not just one agent. Each conversation is its own character:
+
+- The primary agent wears the active character (Cameron by default, or a body it forged for itself, see below).
+- Other agents wear a forged character whose name matches theirs, or get a color-tinted body from the stock cast so everyone is distinct at a glance.
+- New agents walk in from the side when their conversation starts; agents that go quiet drift to the rug or the booth; closed or long-silent conversations walk out through the side and leave.
+- Name plates appear over heads whenever more than one agent is in the room. If more agents are active than fit comfortably, the corner shows a "+N more" counter.
+
+![Multiplayer](docs/multiplayer.png)
+
+Coming next: a watch mode that points the office at a whole Letta server instance and gives a body to every agent running on it.
 
 ## Install
 

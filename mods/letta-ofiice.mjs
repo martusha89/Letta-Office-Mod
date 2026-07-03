@@ -12,6 +12,8 @@ let port = DEFAULT_PORT;
 const clients = new Set();
 let idleTimer = null;
 
+// Legacy single-agent state, kept in sync with the primary roster entry so an
+// older office renderer still works against a newer mod.
 const state = {
   title: "Letta Office",
   status: "idle",
@@ -31,19 +33,140 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function update(patch) {
-  Object.assign(state, patch, { updatedAt: nowIso() });
-  if (patch.bubble) {
-    state.bubbles = [patch.bubble, ...state.bubbles.filter((b) => b !== patch.bubble)].slice(0, 8);
+// ── presence roster: every agent in the harness is a body in the office ──
+// Keyed by conversation id, so subagents and background conversations walk in
+// as their own characters. Quiet agents settle to idle; silent ones walk out.
+const ROSTER_IDLE_MS = 60_000;
+const ROSTER_LEAVE_MS = 5 * 60_000;
+const IDLE_SPOTS = [
+  { station: "rug", bubble: "Taking a tiny coffee-loop break." },
+  { station: "door", bubble: "Stretching my legs." },
+  { station: "meeting", bubble: "Camping the booth." },
+];
+
+const roster = new Map();
+let rosterSweep = null;
+
+function presenceFor(id, name) {
+  const key = String(id || "local");
+  let p = roster.get(key);
+  if (!p) {
+    p = {
+      id: key,
+      name: name ? String(name) : key,
+      status: "idle",
+      station: "rug",
+      bubble: null,
+      firstSeen: Date.now(),
+      lastSeen: Date.now(),
+    };
+    roster.set(key, p);
   }
-  broadcast({ type: "state", state });
+  if (name) p.name = String(name);
+  p.lastSeen = Date.now();
+  if (!rosterSweep) rosterSweep = setInterval(sweepRoster, 15_000);
+  return p;
 }
 
-function scheduleIdle(ms = 45_000) {
-  if (idleTimer) clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => {
-    update({ status: "idle", station: "rug", bubble: "Taking a tiny coffee-loop break.", toolName: null });
-  }, ms);
+function primaryPresence() {
+  let primary = null;
+  for (const p of roster.values()) if (!primary || p.firstSeen < primary.firstSeen) primary = p;
+  return primary;
+}
+
+function characterFor(presence, isPrimary) {
+  const manifest = readManifest();
+  const slug = slugify(presence.name);
+  if (manifest.characters[slug]) return slug;
+  if (isPrimary) return manifest.active;
+  return null; // renderer assigns a tinted stock body
+}
+
+function rosterPayload() {
+  const primary = primaryPresence();
+  return [...roster.values()].map((p) => ({
+    id: p.id,
+    name: p.name,
+    status: p.status,
+    station: p.station,
+    bubble: p.bubble,
+    character: characterFor(p, p === primary),
+    primary: p === primary,
+  }));
+}
+
+function syncLegacyState() {
+  const primary = primaryPresence();
+  if (primary) {
+    state.status = primary.status;
+    state.station = primary.station;
+    if (primary.bubble) state.bubble = primary.bubble;
+    state.agentName = primary.name;
+    state.conversationId = primary.id;
+    state.character = characterFor(primary, true);
+  }
+  state.updatedAt = nowIso();
+  if (state.bubble) {
+    state.bubbles = [state.bubble, ...state.bubbles.filter((b) => b !== state.bubble)].slice(0, 8);
+  }
+}
+
+function broadcastAll() {
+  syncLegacyState();
+  broadcast({ type: "state", state });
+  broadcast({ type: "roster", agents: rosterPayload() });
+}
+
+function updateAgent(id, name, patch) {
+  const p = presenceFor(id, name);
+  if (patch.status !== undefined) p.status = patch.status;
+  if (patch.station !== undefined) p.station = patch.station;
+  if (patch.bubble !== undefined) p.bubble = patch.bubble;
+  if (patch.toolName !== undefined) state.toolName = patch.toolName;
+  broadcastAll();
+}
+
+function removeAgent(id) {
+  if (roster.delete(String(id || "local"))) broadcastAll();
+}
+
+function sweepRoster() {
+  const now = Date.now();
+  let changed = false;
+  for (const [id, p] of roster) {
+    const quiet = now - p.lastSeen;
+    if (quiet > ROSTER_LEAVE_MS) {
+      roster.delete(id);
+      changed = true;
+    } else if (quiet > ROSTER_IDLE_MS && p.status !== "idle") {
+      const spot = IDLE_SPOTS[Math.abs(hashCode(id)) % IDLE_SPOTS.length];
+      p.status = "idle";
+      p.station = spot.station;
+      p.bubble = spot.bubble;
+      changed = true;
+    }
+  }
+  if (roster.size === 0 && rosterSweep) {
+    clearInterval(rosterSweep);
+    rosterSweep = null;
+  }
+  if (changed) broadcastAll();
+}
+
+function hashCode(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return h;
+}
+
+// update() targets the primary agent (used by the sprite forge and commands)
+function update(patch) {
+  const primary = primaryPresence() || presenceFor("local", state.agentName || "agent");
+  if (patch.cwd !== undefined) state.cwd = patch.cwd;
+  if (patch.agentName !== undefined && patch.agentName) primary.name = String(patch.agentName);
+  if (patch.conversationId !== undefined) state.conversationId = patch.conversationId;
+  if (patch.character !== undefined) state.character = patch.character;
+  updateAgent(primary.id, null, patch);
 }
 
 function mapTool(toolName, args = {}) {
@@ -456,7 +579,7 @@ function createServer() {
   return http.createServer((req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
     if (url.pathname === "/state") {
-      sendJson(res, state);
+      sendJson(res, { ...state, agents: rosterPayload() });
       return;
     }
     if (url.pathname === "/events") {
@@ -467,6 +590,7 @@ function createServer() {
         "access-control-allow-origin": "*",
       });
       res.write(`data: ${JSON.stringify({ type: "state", state })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: "roster", agents: rosterPayload() })}\n\n`);
       clients.add(res);
       req.on("close", () => clients.delete(res));
       return;
@@ -519,6 +643,8 @@ function ensureServer() {
 function stopServer() {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = null;
+  if (rosterSweep) clearInterval(rosterSweep);
+  rosterSweep = null;
   for (const res of [...clients]) {
     try { res.end(); } catch {}
   }
@@ -744,20 +870,23 @@ export default function activate(letta) {
     disposers.push(letta.commands.register({ id: "office", description: "Alias for /ofiice", args: "[status|stop|browser|big]", runWhenBusy: true, showInTranscript: false, run }));
   }
 
+  const eventKey = (event, ctx) => event?.conversationId ?? ctx?.conversation?.id ?? "local";
+  const eventName = (event, ctx) => event?.agentName ?? ctx?.agent?.name ?? event?.agentId ?? null;
+
   if (letta.capabilities.events.lifecycle) {
     disposers.push(letta.events.on("conversation_open", (event, ctx) => {
-      update({ agentName: event.agentName ?? event.agentId ?? ctx.agent?.name ?? null, conversationId: event.conversationId ?? null, cwd: ctx.cwd ?? null, status: "idle", station: "rug", bubble: "Conversation opened. Office lights on." });
+      if (ctx?.cwd) state.cwd = ctx.cwd;
+      updateAgent(eventKey(event, ctx), eventName(event, ctx), { status: "idle", station: "rug", bubble: "Office lights on." });
     }));
-    disposers.push(letta.events.on("conversation_close", () => {
-      update({ status: "idle", station: "rug", bubble: "Conversation closed. Lights dimmed." });
+    disposers.push(letta.events.on("conversation_close", (event, ctx) => {
+      removeAgent(eventKey(event, ctx));
     }));
   }
 
   if (letta.capabilities.events.turns) {
     disposers.push(letta.events.on("turn_start", (event, ctx) => {
       state.counters.turns += 1;
-      update({ agentName: ctx.agent?.name ?? state.agentName, conversationId: event.conversationId ?? ctx.conversation?.id ?? state.conversationId, cwd: ctx.cwd ?? state.cwd, status: "thinking", station: "rug", bubble: "New turn. Thinking cap on." });
-      scheduleIdle(60_000);
+      updateAgent(eventKey(event, ctx), eventName(event, ctx), { status: "thinking", station: "rug", bubble: "New turn. Thinking cap on." });
     }));
   }
 
@@ -766,8 +895,7 @@ export default function activate(letta) {
       state.counters.tools += 1;
       const mapped = mapTool(event.toolName, event.args || {});
       if (mapped.status === "delegating") state.counters.subagents += 1;
-      update({ ...mapped, toolName: event.toolName, agentName: ctx.agent?.name ?? state.agentName, conversationId: event.conversationId ?? ctx.conversation?.id ?? state.conversationId, cwd: ctx.cwd ?? state.cwd });
-      scheduleIdle(mapped.status === "testing" || mapped.status === "terminal" ? 90_000 : 50_000);
+      updateAgent(eventKey(event, ctx), eventName(event, ctx), { ...mapped, toolName: event.toolName });
     }));
   }
 
