@@ -1,6 +1,6 @@
 import http from "node:http";
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -21,6 +21,7 @@ const state = {
   cwd: null,
   agentName: null,
   conversationId: null,
+  character: "cameron",
   updatedAt: new Date().toISOString(),
   bubbles: ["Ready when you are."],
   counters: { turns: 0, tools: 0, subagents: 0 },
@@ -166,6 +167,290 @@ function serveOffice(req, res) {
   });
   res.end(readFileSync(file));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sprite forge: agent-callable tools that let the agent design its own office
+// body. The agent writes a visual description of itself; the forge drives
+// PixelLab (create → walking animation → optional desk/whiteboard poses),
+// downloads the sprites into assets/characters/<slug>/, and switches the
+// office avatar. PixelLab purges some generated images from its CDN over
+// time, so everything is stored locally at install.
+const PL_MCP_URL = "https://api.pixellab.ai/mcp";
+const PL_REST_URL = "https://api.pixellab.ai/v2";
+const SPRITE_DIRS = ["south", "east", "north", "west", "south-east", "north-east", "north-west", "south-west"];
+const REFERENCE_CANVAS = 120; // Cameron's native canvas; new characters are scaled to match him on screen
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+const forge = {
+  phase: "idle", // idle | creating | walking | posing | downloading | done | failed
+  name: null,
+  slug: null,
+  characterId: null,
+  detail: "",
+  error: null,
+  startedAt: null,
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function slugify(name) {
+  return String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
+}
+
+async function resolvePixelLabToken(ctx) {
+  for (const name of ["PIXELLAB_SECRET", "PIXELLAB_TOKEN"]) {
+    try {
+      const value = await ctx?.secret?.(name, { envFallback: true });
+      if (value) return value;
+    } catch { /* secret store unavailable; fall through */ }
+    if (process.env[name]) return process.env[name];
+  }
+  try {
+    const cfg = JSON.parse(readFileSync(path.join(OFFICE_ROOT, "pixellab.json"), "utf8"));
+    if (cfg && cfg.token) return String(cfg.token);
+  } catch { /* no config file */ }
+  return null;
+}
+
+const TOKEN_HELP = "No PixelLab token found. Set the PIXELLAB_SECRET agent secret (or PIXELLAB_SECRET / PIXELLAB_TOKEN env var), or write { \"token\": \"...\" } to " + path.join(OFFICE_ROOT, "pixellab.json") + ". Get a token at https://www.pixellab.ai/pixellab-api";
+
+let plCallId = 0;
+// PixelLab's official MCP endpoint answers stateless JSON-RPC POSTs (SSE-framed).
+async function plMcp(token, tool, args) {
+  const id = ++plCallId;
+  const res = await fetch(PL_MCP_URL, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: tool, arguments: args } }),
+  });
+  const text = await res.text();
+  let msg = null;
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    try {
+      const parsed = JSON.parse(line.slice(5));
+      if (parsed.id === id && (parsed.result || parsed.error)) msg = parsed;
+    } catch { /* keep scanning frames */ }
+  }
+  if (!msg) { try { msg = JSON.parse(text); } catch { /* not plain JSON either */ } }
+  if (!msg) throw new Error(`PixelLab MCP: unreadable response (http ${res.status})`);
+  if (msg.error) throw new Error(`PixelLab MCP: ${msg.error.message || "unknown error"}`);
+  const content = (msg.result?.content || []).map((c) => c.text || "").join("\n");
+  if (msg.result?.isError) throw new Error(`PixelLab: ${content.slice(0, 400)}`);
+  return content;
+}
+
+async function plRest(token, route) {
+  const res = await fetch(`${PL_REST_URL}${route}`, { headers: { authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`PixelLab ${route} → http ${res.status}`);
+  return res.json();
+}
+
+function extractNewUuid(text, excludeIds) {
+  const exclude = new Set((excludeIds || []).map((s) => String(s).toLowerCase()));
+  for (const match of String(text).match(UUID_RE) || []) {
+    if (!exclude.has(match.toLowerCase())) return match.toLowerCase();
+  }
+  return null;
+}
+
+function hasRotations(character) {
+  return character && character.rotation_urls && Object.values(character.rotation_urls).filter(Boolean).length >= 4;
+}
+
+async function pollCharacter(token, characterId, { needAnimation = null, timeoutMs = 20 * 60_000 } = {}) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const character = await plRest(token, `/characters/${characterId}`).catch(() => null);
+    if (hasRotations(character)) {
+      if (!needAnimation) return character;
+      const anim = (character.animations || []).find((a) =>
+        a.animation_type === needAnimation && (a.directions || []).some((d) => (d.frames || []).length > 0));
+      if (anim) return character;
+    }
+    await sleep(10_000);
+  }
+  throw new Error("PixelLab generation timed out (20 minutes)");
+}
+
+async function downloadPng(url, dest) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`sprite download failed (http ${res.status}): ${url}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  mkdirSync(path.dirname(dest), { recursive: true });
+  writeFileSync(dest, buf);
+  return buf;
+}
+
+function pngWidth(buf) {
+  try { return buf.readUInt32BE(16) || null; } catch { return null; }
+}
+
+function manifestPath() {
+  return path.join(OFFICE_ROOT, "assets", "characters.json");
+}
+function readManifest() {
+  try {
+    const parsed = JSON.parse(readFileSync(manifestPath(), "utf8"));
+    if (parsed && parsed.characters) return parsed;
+  } catch { /* first run */ }
+  return { active: "cameron", characters: { cameron: { name: "Cameron", builtin: true } } };
+}
+function writeManifest(manifest) {
+  mkdirSync(path.dirname(manifestPath()), { recursive: true });
+  writeFileSync(manifestPath(), JSON.stringify(manifest, null, 2));
+}
+function uniqueSlug(name) {
+  const manifest = readManifest();
+  let slug = slugify(name);
+  if (slug === "cameron") slug = "cameron-2"; // the built-in stays untouchable
+  while (manifest.characters[slug]) slug = `${slug}-2`;
+  return slug;
+}
+function setActiveCharacter(slug) {
+  const manifest = readManifest();
+  if (!manifest.characters[slug]) throw new Error(`Unknown character '${slug}'. Installed: ${Object.keys(manifest.characters).join(", ")}`);
+  manifest.active = slug;
+  writeManifest(manifest);
+  update({ character: slug, bubble: `Now appearing as ${manifest.characters[slug].name || slug}.` });
+  return manifest.characters[slug].name || slug;
+}
+
+async function installCharacter(token, { slug, name, characterId, sitId, presentId }) {
+  const character = await pollCharacter(token, characterId, { timeoutMs: 60_000 });
+  const baseDir = path.join(OFFICE_ROOT, "assets", "characters", slug);
+  let canvas = REFERENCE_CANVAS;
+  for (const dir of SPRITE_DIRS) {
+    const url = character.rotation_urls?.[dir];
+    if (!url) continue;
+    const buf = await downloadPng(url, path.join(baseDir, "idle", `${dir}.png`));
+    if (dir === "south") canvas = pngWidth(buf) || canvas;
+  }
+  let walkFrames = 0;
+  const walk = (character.animations || []).find((a) => a.animation_type === "walking");
+  for (const entry of walk?.directions || []) {
+    const frames = entry.frames || [];
+    walkFrames = Math.max(walkFrames, frames.length);
+    for (let i = 0; i < frames.length; i++) {
+      await downloadPng(frames[i], path.join(baseDir, "walk", entry.direction, `${i}.png`));
+    }
+  }
+  const poses = { sit: false, present: false };
+  for (const [pose, id] of [["sit", sitId], ["present", presentId]]) {
+    if (!id) continue;
+    const stateChar = await pollCharacter(token, id, { timeoutMs: 60_000 }).catch(() => null);
+    for (const dir of SPRITE_DIRS) {
+      const url = stateChar?.rotation_urls?.[dir];
+      if (!url) continue;
+      await downloadPng(url, path.join(baseDir, pose, `${dir}.png`));
+      poses[pose] = true;
+    }
+  }
+  // scale so every character stands Cameron-height regardless of native canvas
+  const ratio = REFERENCE_CANVAS / canvas;
+  const meta = {
+    name,
+    characterId,
+    canvas,
+    walkFrames,
+    poses,
+    scale: +(2.1 * ratio).toFixed(3),
+    sitScale: +(1.9 * ratio).toFixed(3),
+    feetAnchor: 0.82,
+    sitFeetAnchor: 0.82,
+    created: nowIso(),
+  };
+  writeFileSync(path.join(baseDir, "meta.json"), JSON.stringify(meta, null, 2));
+  const manifest = readManifest();
+  manifest.characters[slug] = { name, dir: `characters/${slug}` };
+  writeManifest(manifest);
+  return meta;
+}
+
+async function runForge(token, { name, description, withPoses }) {
+  const slug = uniqueSlug(name);
+  Object.assign(forge, { phase: "creating", name, slug, characterId: null, detail: "creating base character", error: null, startedAt: Date.now() });
+  update({ status: "forging", station: "gallery", bubble: `Forging a new body for ${name}...` });
+  try {
+    const created = await plMcp(token, "create_character", {
+      description,
+      name,
+      mode: "v3",
+      size: 86,
+      view: "low top-down",
+      n_directions: 8,
+    });
+    const characterId = extractNewUuid(created, []);
+    if (!characterId) throw new Error(`PixelLab did not return a character id. Response: ${created.slice(0, 200)}`);
+    forge.characterId = characterId;
+    await pollCharacter(token, characterId);
+
+    forge.phase = "walking";
+    forge.detail = "walking animation";
+    update({ bubble: `Teaching ${name} to walk...` });
+    await plMcp(token, "animate_character", { character_id: characterId, template_animation_id: "walking" });
+    await pollCharacter(token, characterId, { needAnimation: "walking" });
+
+    let sitId = null;
+    let presentId = null;
+    if (withPoses) {
+      forge.phase = "posing";
+      forge.detail = "desk-sitting pose";
+      update({ bubble: `Fitting ${name} into the desk chair...` });
+      try {
+        const sitText = await plMcp(token, "create_character_state", {
+          character_id: characterId,
+          edit_description: "sitting on an office chair, hands typing on a keyboard",
+          use_color_palette_from_reference: true,
+        });
+        sitId = extractNewUuid(sitText, [characterId]);
+        if (sitId) await pollCharacter(token, sitId);
+      } catch { sitId = null; /* pose is optional; the renderer falls back to standing */ }
+      forge.detail = "whiteboard-presenting pose";
+      update({ bubble: `Handing ${name} a whiteboard marker...` });
+      try {
+        const presentText = await plMcp(token, "create_character_state", {
+          character_id: characterId,
+          edit_description: "standing and gesturing with one raised arm, presenting",
+          use_color_palette_from_reference: true,
+        });
+        presentId = extractNewUuid(presentText, [characterId, sitId].filter(Boolean));
+        if (presentId) await pollCharacter(token, presentId);
+      } catch { presentId = null; }
+    }
+
+    forge.phase = "downloading";
+    forge.detail = "downloading and installing sprites";
+    update({ bubble: "Wardrobe change in progress..." });
+    await installCharacter(token, { slug, name, characterId, sitId, presentId });
+    setActiveCharacter(slug);
+    forge.phase = "done";
+    forge.detail = "";
+    update({ status: "idle", station: "rug", bubble: `${name} has entered the office.` });
+  } catch (err) {
+    forge.phase = "failed";
+    forge.error = String(err?.message || err);
+    update({ status: "idle", station: "rug", bubble: `Forge failed: ${forge.error.slice(0, 90)}` });
+  }
+}
+
+function forgeStatusText() {
+  const manifest = readManifest();
+  const installed = Object.entries(manifest.characters)
+    .map(([slug, c]) => `${slug}${manifest.active === slug ? " (active)" : ""}: ${c.name || slug}`)
+    .join("; ");
+  if (forge.phase === "idle") return `No forge running. Characters — ${installed}`;
+  const elapsed = forge.startedAt ? Math.round((Date.now() - forge.startedAt) / 1000) : 0;
+  if (forge.phase === "failed") return `Forge FAILED for '${forge.name}' after ${elapsed}s: ${forge.error}. Characters — ${installed}`;
+  if (forge.phase === "done") return `Forge complete: '${forge.name}' is installed and active (took ${elapsed}s). Characters — ${installed}`;
+  return `Forging '${forge.name}': ${forge.phase} (${forge.detail}), ${elapsed}s elapsed. Character generation takes 5-15 minutes; check again in a minute or two. Characters — ${installed}`;
+}
+
+const forgeBusy = () => ["creating", "walking", "posing", "downloading"].includes(forge.phase);
 
 function createServer() {
   return http.createServer((req, res) => {
@@ -329,6 +614,112 @@ fetch('/state').then(r=>r.json()).then(apply).catch(()=>{});const es=new EventSo
 }
 export default function activate(letta) {
   const disposers = [];
+  state.character = readManifest().active;
+
+  if (letta.capabilities.tools) {
+    disposers.push(letta.tools.register({
+      name: "office_new_character",
+      description: "Design your own pixel-art body for the Letta Office. You write a concrete visual description of yourself (build, hair, clothing and their colors — pixel art cannot render vibes, lighting, or subtle expressions) and PixelLab forges an 8-direction character with a walking animation, plus desk-sitting and whiteboard-presenting poses unless with_poses is false. When it finishes, the office avatar switches to you. Costs PixelLab credits (roughly 10-30 generations) and takes 5-15 minutes; this tool returns immediately — poll office_character_status for progress. Requires a PixelLab API token (PIXELLAB_SECRET agent secret or env var, or a pixellab.json next to the office assets).",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Your name — used for the character and the office roster" },
+          description: { type: "string", description: "Visual appearance, concrete and color-blocked. Example: 'Tall lean man, late 30s, olive skin. Dark brown wavy hair. Black henley with sleeves pushed up, charcoal jeans, barefoot.'" },
+          with_poses: { type: "boolean", description: "Also generate desk-sitting and whiteboard-presenting poses (a few extra generations). Default true." },
+        },
+        required: ["name", "description"],
+        additionalProperties: false,
+      },
+      parallelSafe: false,
+      async run(ctx) {
+        const { name, description, with_poses } = ctx.args || {};
+        if (!name || !description) return "Both name and description are required.";
+        if (forgeBusy()) return `A forge is already running: ${forgeStatusText()}`;
+        const token = await resolvePixelLabToken(ctx);
+        if (!token) return TOKEN_HELP;
+        runForge(token, { name, description, withPoses: with_poses !== false });
+        return `Forge started for '${name}'. It runs in the background and takes 5-15 minutes (creation, walking animation${with_poses !== false ? ", desk and whiteboard poses" : ""}, download). Poll office_character_status for progress. Open /office to watch.`;
+      },
+    }));
+
+    disposers.push(letta.tools.register({
+      name: "office_character_status",
+      description: "Check the sprite forge (character generation) progress and list the characters installed in the Letta Office, including which one is active.",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      requiresApproval: false,
+      parallelSafe: true,
+      run() {
+        return forgeStatusText();
+      },
+    }));
+
+    disposers.push(letta.tools.register({
+      name: "office_adopt_character",
+      description: "Install an existing PixelLab character as an office avatar (free — no generations spent, it only downloads sprites you already own). Use this if you already created a character with the PixelLab MCP server or web UI and want to wear it in the office. The character should be 8-direction, low top-down view, ideally with a 'walking' animation. Optional sit/present character-state ids add desk and whiteboard poses. Switches the office avatar when done.",
+      parameters: {
+        type: "object",
+        properties: {
+          character_id: { type: "string", description: "PixelLab character UUID to adopt" },
+          name: { type: "string", description: "Display name for the office roster" },
+          sit_character_id: { type: "string", description: "Optional character-state UUID for the sitting pose" },
+          present_character_id: { type: "string", description: "Optional character-state UUID for the presenting pose" },
+        },
+        required: ["character_id", "name"],
+        additionalProperties: false,
+      },
+      requiresApproval: false,
+      parallelSafe: false,
+      async run(ctx) {
+        const { character_id, name, sit_character_id, present_character_id } = ctx.args || {};
+        if (!character_id || !name) return "Both character_id and name are required.";
+        if (forgeBusy()) return `A forge is already running: ${forgeStatusText()}`;
+        const token = await resolvePixelLabToken(ctx);
+        if (!token) return TOKEN_HELP;
+        const slug = uniqueSlug(name);
+        Object.assign(forge, { phase: "downloading", name, slug, characterId: character_id, detail: "adopting existing character", error: null, startedAt: Date.now() });
+        try {
+          const meta = await installCharacter(token, { slug, name, characterId: character_id, sitId: sit_character_id || null, presentId: present_character_id || null });
+          setActiveCharacter(slug);
+          forge.phase = "done";
+          const warnings = [
+            meta.walkFrames ? null : "no walking animation found (the avatar will glide; run animate_character with template 'walking' on PixelLab and re-adopt)",
+            meta.poses.sit ? null : "no sitting pose",
+            meta.poses.present ? null : "no presenting pose",
+          ].filter(Boolean);
+          return `Adopted '${name}' (${slug}) and switched the office avatar.${warnings.length ? ` Notes: ${warnings.join("; ")}.` : ""}`;
+        } catch (err) {
+          forge.phase = "failed";
+          forge.error = String(err?.message || err);
+          return `Adopt failed: ${forge.error}`;
+        }
+      },
+    }));
+
+    disposers.push(letta.tools.register({
+      name: "office_use_character",
+      description: "Switch which installed character is the active Letta Office avatar. 'cameron' is the built-in default. Use office_character_status to list installed characters.",
+      parameters: {
+        type: "object",
+        properties: { name: { type: "string", description: "Character slug or name from the roster" } },
+        required: ["name"],
+        additionalProperties: false,
+      },
+      requiresApproval: false,
+      parallelSafe: false,
+      run(ctx) {
+        const requested = String(ctx.args?.name || "").trim();
+        if (!requested) return "name is required.";
+        const manifest = readManifest();
+        const slug = manifest.characters[requested]
+          ? requested
+          : Object.keys(manifest.characters).find((s) =>
+              s === slugify(requested) || (manifest.characters[s].name || "").toLowerCase() === requested.toLowerCase());
+        if (!slug) return `Unknown character '${requested}'. Installed: ${Object.keys(manifest.characters).join(", ")}`;
+        const shown = setActiveCharacter(slug);
+        return `Office avatar switched to ${shown}.`;
+      },
+    }));
+  }
 
   if (letta.capabilities.commands) {
     const run = async (ctx) => {

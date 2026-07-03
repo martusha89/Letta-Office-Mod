@@ -72,15 +72,81 @@ function loadImage(src) {
 
 const assets = { idle: {}, walk: {}, sit: {}, present: {}, props: {} };
 
-async function loadAssets() {
-  await Promise.all(DIRS8.map(async (d) => { assets.idle[d] = await loadImage(`./assets/cameron-${d}.png`); }));
+// ── characters ──
+// assets/characters.json (written by the mod's sprite forge) lists installed
+// characters; agent-forged ones live in assets/characters/<slug>/ with a
+// meta.json carrying their scale so everyone stands Cameron-height. With no
+// manifest (plain file:// open, fresh install) Cameron loads from his
+// original paths.
+const CHARACTER = { slug: "cameron", loading: null };
+
+async function fetchJson(url) {
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    return r.ok ? await r.json() : null;
+  } catch (e) { return null; }
+}
+
+function cameronPaths() {
+  return {
+    idle: (d) => `./assets/cameron-${d}.png`,
+    walk: (d, i) => `./assets/animations/walk/${d}/${i}.png`,
+    sit: (d) => `./assets/cameron-sit/${d}.png`,
+    present: (d) => `./assets/cameron-present/${d}.png`,
+    meta: { walkFrames: CONFIG.walkFrames, scale: 2.1, sitScale: 1.9, feetAnchor: 0.82, sitFeetAnchor: 0.82 },
+  };
+}
+
+async function characterPaths(slug) {
+  const manifest = await fetchJson("./assets/characters.json");
+  const entry = manifest?.characters?.[slug];
+  if (!entry || entry.builtin) return { slug: entry ? slug : "cameron", ...cameronPaths() };
+  const base = `./assets/${entry.dir}`;
+  const meta = (await fetchJson(`${base}/meta.json`)) || {};
+  return {
+    slug,
+    idle: (d) => `${base}/idle/${d}.png`,
+    walk: (d, i) => `${base}/walk/${d}/${i}.png`,
+    sit: (d) => `${base}/sit/${d}.png`,
+    present: (d) => `${base}/present/${d}.png`,
+    meta: {
+      walkFrames: meta.walkFrames || CONFIG.walkFrames,
+      scale: meta.scale || 2.1,
+      sitScale: meta.sitScale || 1.9,
+      feetAnchor: meta.feetAnchor || 0.82,
+      sitFeetAnchor: meta.sitFeetAnchor || 0.82,
+    },
+  };
+}
+
+async function loadCharacter(slug) {
+  const P = await characterPaths(slug);
+  const next = { idle: {}, walk: {}, sit: {}, present: {} };
+  await Promise.all(DIRS8.map(async (d) => { next.idle[d] = await loadImage(P.idle(d)); }));
   await Promise.all(WALK_DIRS.map(async (d) => {
-    assets.walk[d] = await Promise.all(
-      Array.from({ length: CONFIG.walkFrames }, (_, i) => loadImage(`./assets/animations/walk/${d}/${i}.png`)),
+    const frames = await Promise.all(
+      Array.from({ length: P.meta.walkFrames }, (_, i) => loadImage(P.walk(d, i))),
     );
+    next.walk[d] = frames.filter(Boolean); // missing frames fall back to idle glide
   }));
-  await Promise.all(DIRS8.map(async (d) => { assets.sit[d] = await loadImage(`./assets/cameron-sit/${d}.png`); }));
-  await Promise.all(DIRS8.map(async (d) => { assets.present[d] = await loadImage(`./assets/cameron-present/${d}.png`); }));
+  await Promise.all(DIRS8.map(async (d) => { next.sit[d] = await loadImage(P.sit(d)); }));
+  await Promise.all(DIRS8.map(async (d) => { next.present[d] = await loadImage(P.present(d)); }));
+  Object.assign(assets, { idle: next.idle, walk: next.walk, sit: next.sit, present: next.present });
+  CONFIG.charScale = P.meta.scale;
+  CONFIG.sitScale = P.meta.sitScale;
+  CONFIG.feetAnchor = P.meta.feetAnchor;
+  CONFIG.sitFeetAnchor = P.meta.sitFeetAnchor;
+  CHARACTER.slug = P.slug;
+}
+
+function switchCharacter(slug) {
+  if (!slug || slug === CHARACTER.slug || CHARACTER.loading) return;
+  CHARACTER.loading = loadCharacter(slug).finally(() => { CHARACTER.loading = null; });
+}
+
+async function loadAssets() {
+  const manifest = await fetchJson("./assets/characters.json");
+  await loadCharacter(manifest?.active || "cameron");
   await Promise.all(CONFIG.props.map(async (p) => { assets.props[p.id] = await loadImage(p.asset); }));
 }
 
@@ -544,6 +610,7 @@ function connectLive() {
       else if (m.type === "say") say(m.text, m.ttl);
       else if (m.type === "init" && m.pose) setPose(m.pose);
       else if (m.type === "state" && m.state) {
+        if (m.state.character) switchCharacter(m.state.character);
         setPose(SAM_STATION_TO_POSE[m.state.station] || "idle");
         if (m.state.bubble) say(m.state.bubble, 4200);
       }

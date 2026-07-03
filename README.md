@@ -44,6 +44,25 @@ He is depth-sorted against the furniture, so he passes in front of some pieces a
 - `/office status` prints the local URL without opening a window.
 - `/office stop` closes the local server.
 
+## Agents can forge their own body
+
+The default pixel developer is Cameron, but the mod registers agent-callable tools so your agent can design its own avatar and move into the office wearing it. The agent writes a visual description of itself, [PixelLab](https://www.pixellab.ai) generates an 8-direction character with a walking animation (plus desk-sitting and whiteboard-presenting poses), and the office switches to the new body live, no refresh needed. Sprites are downloaded into `Letta-Ofiice/assets/characters/<name>/` at install, so they are yours permanently.
+
+| Tool | What it does |
+|---|---|
+| `office_new_character` | Forge a new avatar from a self-description (runs in the background, 5-15 min, ~10-30 PixelLab generations) |
+| `office_character_status` | Check forge progress and list installed characters |
+| `office_adopt_character` | Install a character you already made with the [PixelLab MCP server](https://github.com/pixellab-code/pixellab-mcp) or web UI (free, download only) |
+| `office_use_character` | Switch the active avatar (Cameron is always available) |
+
+Setup: the forge needs a [PixelLab API token](https://www.pixellab.ai/pixellab-api). Give it to the mod one of three ways:
+
+- a `PIXELLAB_SECRET` agent secret in Letta Code (recommended)
+- a `PIXELLAB_SECRET` or `PIXELLAB_TOKEN` environment variable
+- a `pixellab.json` file next to the office assets: `{ "token": "..." }`
+
+Then just ask your agent something like *"design yourself a body and move into the office"*. Descriptions work best when they are concrete and color-blocked (build, hair, clothing and their colors); pixel art at this size cannot render moods or lighting. Creating a character costs PixelLab generations, so the create tool asks for approval; status checks, adopting an existing character, and switching avatars are free and unprompted.
+
 ## How it works
 
 - The mod (`letta-ofiice.mjs`) hooks Letta Code lifecycle, turn, and tool events, maps each one to a station (desk, shelf, whiteboard, terminal, booth, and so on), and broadcasts the current state to the page over `/events` using Server-Sent Events.
