@@ -12,7 +12,7 @@
 const CONFIG = {
   canvas: [800, 600],
   floorTop: 250,
-  editable: false,        // set true to rearrange furniture in-browser (press E); ships OFF
+  editable: true,         // press E in the office to rearrange it; layout persists to layout.json
   charScale: 2.1,         // standing / walking
   sitScale: 1.9,          // seated at the desk (kept where it looked perfect)
   feetAnchor: 0.82,
@@ -474,12 +474,22 @@ function drawRoom() {
   ctx.beginPath(); ctx.moveTo(545, 118); ctx.lineTo(545, 104); ctx.moveTo(545, 118); ctx.lineTo(556, 122); ctx.stroke();
 }
 
+async function loadPropImage(p) {
+  const img = await loadImage(p.asset);
+  // custom map-objects come with unpredictable transparent padding, so they
+  // anchor by visible pixels; the built-in props keep their hand-tuned bases
+  if (img && p.custom) img.__metrics = measureContent(img);
+  assets.props[p.id] = img;
+  return img;
+}
+
 function drawProp(p) {
   const img = assets.props[p.id];
   if (!img) return;
   const w = img.width * p.scale, h = img.height * p.scale;
   const left = Math.round(p.x - w / 2);
-  const top = Math.round(p.flat ? p.y - h / 2 : p.y - h);
+  const m = img.__metrics;
+  const top = Math.round(p.flat ? p.y - h / 2 : (m ? p.y - h * m.bottomRatio : p.y - h));
   ctx.drawImage(img, left, top, w, h);
 }
 
@@ -596,7 +606,13 @@ const dragOff = { x: 0, y: 0 };
 const LAYOUT_KEY = "letta-ofiice-layout";
 
 function layoutData() {
-  return CONFIG.props.map((p) => ({ id: p.id, x: Math.round(p.x), y: Math.round(p.y), scale: +p.scale.toFixed(3), flat: !!p.flat }));
+  return {
+    version: 2,
+    props: CONFIG.props.map((p) => ({
+      id: p.id, x: Math.round(p.x), y: Math.round(p.y), scale: +p.scale.toFixed(3), flat: !!p.flat,
+      ...(p.custom ? { asset: p.asset, custom: true } : {}),
+    })),
+  };
 }
 // robust copy that also works from a double-clicked file:// page (no clipboard API)
 function copyText(text) {
@@ -618,10 +634,32 @@ function saveLayout() {
     fetch("layout", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data) }).catch(() => {});
   }
 }
+// The layout file is the office's source of truth: the full prop list,
+// including custom props generated into assets/props/custom/. Reconciling
+// against it adds custom props and drops removed ones; a legacy plain-array
+// file (positions only) still applies.
 function applyLayout(saved) {
-  for (const s of saved) {
-    const p = CONFIG.props.find((q) => q.id === s.id);
-    if (p) { p.x = s.x; p.y = s.y; p.scale = s.scale; }
+  const list = Array.isArray(saved) ? saved : (saved && Array.isArray(saved.props) ? saved.props : null);
+  if (!list) return;
+  const fullList = !Array.isArray(saved); // v2 files carry the complete room
+  const seen = new Set();
+  for (const s of list) {
+    seen.add(s.id);
+    let p = CONFIG.props.find((q) => q.id === s.id);
+    if (!p && s.asset) {
+      p = { id: s.id, asset: s.asset, x: s.x, y: s.y, scale: s.scale || 1.5, flat: !!s.flat, custom: true };
+      CONFIG.props.push(p);
+      loadPropImage(p);
+    }
+    if (p) {
+      p.x = s.x; p.y = s.y; p.scale = s.scale;
+      if (s.flat !== undefined) p.flat = !!s.flat;
+    }
+  }
+  if (fullList) {
+    for (let i = CONFIG.props.length - 1; i >= 0; i--) {
+      if (!seen.has(CONFIG.props[i].id)) CONFIG.props.splice(i, 1);
+    }
   }
 }
 function mergeSavedLayout() {
@@ -634,8 +672,9 @@ function mergeSavedLayout() {
 async function loadLayoutFile() {
   try {
     const r = await fetch("layout.json", { cache: "no-store" });
-    if (r.ok) applyLayout(await r.json());
+    if (r.ok) { applyLayout(await r.json()); return true; }
   } catch (e) { /* no file yet / file:// */ }
+  return false;
 }
 
 function propBBox(p) {
@@ -669,8 +708,8 @@ function updateStatus() {
     return;
   }
   statusEl.textContent = selected
-    ? `EDIT · ${selected.id}  x:${Math.round(selected.x)} y:${Math.round(selected.y)} scale:${selected.scale.toFixed(2)}  ·  arrows move (shift=10) · +/- size · Del remove · S copy`
-    : "EDIT MODE · click a piece · arrows/+/-/Del · S copies layout · E exits";
+    ? `EDIT · ${selected.id}  x:${Math.round(selected.x)} y:${Math.round(selected.y)} scale:${selected.scale.toFixed(2)}  ·  arrows move (shift=10) · +/- size · Del remove · G new prop · S copy`
+    : "EDIT MODE · click a piece · arrows/+/-/Del · G generates a new prop · S copies layout · E exits";
 }
 
 canvas.addEventListener("mousedown", (e) => {
@@ -708,6 +747,27 @@ window.addEventListener("keydown", (e) => {
     copyText(data);
     if (statusEl) statusEl.textContent = "layout copied to clipboard";
     try { window.prompt("Your office layout (copy with Ctrl+A then Ctrl+C):", data); } catch (err) {}
+    e.preventDefault();
+    return;
+  }
+  // G generates a new prop through the mod's PixelLab pipeline (http only)
+  if ((e.key === "g" || e.key === "G") && editMode) {
+    if (!location.protocol.startsWith("http")) {
+      if (statusEl) statusEl.textContent = "prop generation needs the office served by the mod (/office)";
+      return;
+    }
+    const desc = window.prompt("Describe the new prop (concrete pixel-art terms, e.g. 'arcade cabinet with glowing purple screen'):");
+    if (!desc) return;
+    if (statusEl) statusEl.textContent = "forging prop... (~30-60s, 1 PixelLab generation)";
+    fetch("prop", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ description: desc }) })
+      .then(async (r) => {
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "generation failed");
+        await loadLayoutFile();
+        selected = CONFIG.props.find((p) => p.id === j.id) || null;
+        updateStatus();
+      })
+      .catch((err) => { if (statusEl) statusEl.textContent = `prop failed: ${String(err.message).slice(0, 90)}`; });
     e.preventDefault();
     return;
   }
@@ -865,6 +925,7 @@ function connectLive() {
       if (!live) { live = true; window.stopDemo(); }
       if (editMode) return;
       if (m.type === "roster" && Array.isArray(m.agents)) applyRoster(m.agents);
+      else if (m.type === "layout") loadLayoutFile(); // another window or an agent changed the room
       else if (m.type === "pose") setPose(m.pose);
       else if (m.type === "say") say(m.text, m.ttl);
       else if (m.type === "init" && m.pose) setPose(m.pose);
@@ -893,7 +954,7 @@ async function loadAssets() {
     ? manifest.active
     : "cameron";
   if (activeSlug !== "cameron") await ensureCharset(activeSlug);
-  await Promise.all(CONFIG.props.map(async (p) => { assets.props[p.id] = await loadImage(p.asset); }));
+  await Promise.all(CONFIG.props.map((p) => loadPropImage(p)));
   const primaryName = manifest?.characters?.[activeSlug]?.name || "Cameron";
   const primary = spawnActor("local", primaryName, activeSlug, { atDoor: false });
   primaryActorId = "local";
@@ -901,8 +962,11 @@ async function loadAssets() {
 }
 
 loadAssets().then(async () => {
-  // saved overrides only apply while authoring; the shipped build is pure code defaults
-  if (CONFIG.editable) { mergeSavedLayout(); await loadLayoutFile(); }
+  mergeSavedLayout();
+  const hadLayoutFile = await loadLayoutFile();
+  // first open over http: persist the default room so the mod and the agent
+  // tools have a layout.json to work against
+  if (!hadLayoutFile && location.protocol.startsWith("http")) saveLayout();
   setPose("idle");
   connectLive();
   startDemo();

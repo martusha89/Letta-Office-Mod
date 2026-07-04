@@ -40,7 +40,7 @@ const ROSTER_IDLE_MS = 60_000;
 const ROSTER_LEAVE_MS = 5 * 60_000;
 const IDLE_SPOTS = [
   { station: "rug", bubble: "Taking a tiny coffee-loop break." },
-  { station: "door", bubble: "Stretching my legs." },
+  { station: "shelf", bubble: "Browsing the shelf while I wait." },
   { station: "meeting", bubble: "Camping the booth." },
 ];
 
@@ -561,6 +561,117 @@ async function runForge(token, { name, description, withPoses }) {
   }
 }
 
+// ── prop forge: generate furniture and decorations into the office ──
+// PixelLab map-objects purge from their CDN after ~8 hours, so the PNG is
+// saved into the office assets folder the moment the job completes. The
+// office layout lives in layout.json (full prop list, custom assets included)
+// which the renderer writes on first open and treats as the source of truth.
+function layoutPath() {
+  return path.join(OFFICE_ROOT, "layout.json");
+}
+function readLayout() {
+  try {
+    const parsed = JSON.parse(readFileSync(layoutPath(), "utf8"));
+    if (Array.isArray(parsed)) return { version: 2, props: parsed }; // legacy positions-only file
+    if (parsed && Array.isArray(parsed.props)) return parsed;
+  } catch { /* not written yet */ }
+  return null;
+}
+function writeLayout(layout) {
+  writeFileSync(layoutPath(), JSON.stringify(layout, null, 2));
+  broadcast({ type: "layout" });
+}
+function uniquePropId(layout, base) {
+  let id = base || "prop";
+  while (layout.props.some((p) => p.id === id)) id = `${id}-2`;
+  return id;
+}
+
+// Walk the job payload for the first base64 image string; PixelLab wraps it
+// as { type, base64, format } but the nesting is not guaranteed.
+function findBase64(node) {
+  if (!node) return null;
+  if (typeof node === "string") {
+    return node.length > 256 && /^[A-Za-z0-9+/=\s]+$/.test(node.slice(0, 64)) ? node : null;
+  }
+  if (typeof node === "object") {
+    if (typeof node.base64 === "string") return node.base64;
+    for (const value of Object.values(node)) {
+      const found = findBase64(value);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+async function createProp(token, { name, description, x, y, flat }) {
+  const layout = readLayout();
+  if (!layout) throw new Error("No layout.json yet. Open /office once so the room saves its layout, then try again.");
+  const id = uniquePropId(layout, slugify(name || description.slice(0, 28)));
+  const createResp = await fetch(`${PL_REST_URL}/map-objects`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      description,
+      image_size: { width: 128, height: 128 },
+      view: "low top-down",
+      detail: "medium detail",
+      outline: "single color outline",
+      shading: "medium shading",
+    }),
+  });
+  if (!createResp.ok) throw new Error(`PixelLab create ${createResp.status}: ${(await createResp.text()).slice(0, 200)}`);
+  const created = await createResp.json();
+  const jobId = created.background_job_id;
+  if (!jobId) throw new Error("PixelLab did not return a background job id");
+
+  const deadline = Date.now() + 180_000;
+  let b64 = null;
+  while (Date.now() < deadline) {
+    const poll = await fetch(`${PL_REST_URL}/background-jobs/${jobId}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (!poll.ok) throw new Error(`PixelLab poll ${poll.status}`);
+    const job = await poll.json();
+    if (job.status === "completed") {
+      b64 = findBase64(job.last_response);
+      break;
+    }
+    if (job.status === "failed") throw new Error("PixelLab prop generation failed");
+    await sleep(3000);
+  }
+  if (!b64) throw new Error("PixelLab prop generation timed out (3 minutes)");
+
+  const file = path.join(OFFICE_ROOT, "assets", "props", "custom", `${id}.png`);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, Buffer.from(b64.replace(/^data:image\/png;base64,/, "").replace(/\s/g, ""), "base64"));
+
+  const entry = {
+    id,
+    asset: `./assets/props/custom/${id}.png`,
+    x: Math.max(40, Math.min(760, Math.round(x ?? 400))),
+    y: Math.max(300, Math.min(576, Math.round(y ?? 440))),
+    scale: 1.5,
+    flat: !!flat,
+    custom: true,
+  };
+  const fresh = readLayout(); // reread in case the editor saved meanwhile
+  entry.id = uniquePropId(fresh, entry.id);
+  fresh.props.push(entry);
+  writeLayout(fresh);
+  return entry;
+}
+
+function removeProp(id) {
+  const layout = readLayout();
+  if (!layout) return null;
+  const entry = layout.props.find((p) => p.id === id);
+  if (!entry) return null;
+  layout.props = layout.props.filter((p) => p.id !== id);
+  writeLayout(layout); // the PNG stays on disk so the prop can be re-added
+  return entry;
+}
+
 function forgeStatusText() {
   const manifest = readManifest();
   const installed = Object.entries(manifest.characters)
@@ -606,11 +717,30 @@ function createServer() {
         try {
           JSON.parse(body); // validate before writing
           writeFileSync(path.join(OFFICE_ROOT, "layout.json"), body);
+          broadcast({ type: "layout" }); // other open office windows re-sync
           res.writeHead(200, { "content-type": "application/json" });
           res.end('{"ok":true}');
         } catch (e) {
           res.writeHead(400, { "content-type": "text/plain" });
           res.end("bad layout");
+        }
+      });
+      return;
+    }
+    if (url.pathname === "/prop" && req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; if (body.length > 20000) req.destroy(); });
+      req.on("end", async () => {
+        try {
+          const args = JSON.parse(body);
+          if (!args.description) throw new Error("description is required");
+          const token = await resolvePixelLabToken(null);
+          if (!token) throw new Error(TOKEN_HELP);
+          const entry = await createProp(token, args);
+          sendJson(res, entry);
+        } catch (e) {
+          res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: String(e?.message || e) }));
         }
       });
       return;
@@ -818,6 +948,69 @@ export default function activate(letta) {
           forge.error = String(err?.message || err);
           return `Adopt failed: ${forge.error}`;
         }
+      },
+    }));
+
+    disposers.push(letta.tools.register({
+      name: "office_add_prop",
+      description: "Generate a new pixel-art prop (furniture, decoration, equipment) and place it in the Letta Office. Costs 1 PixelLab generation and takes 30-90 seconds. Describe it concretely in cozy pixel-art terms, e.g. 'arcade cabinet with a glowing purple screen' or 'small bookshelf stuffed with rubber ducks'. Requires the PixelLab token (same setup as office_new_character). The prop lands near the given position (defaults to the open floor) and can be rearranged in the office editor.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Short name for the prop, used as its id" },
+          description: { type: "string", description: "What to generate, concrete and visual" },
+          x: { type: "number", description: "X position in the 800-wide room (40-760, default 400)" },
+          y: { type: "number", description: "Y position in the 600-tall room (300-576, default 440)" },
+          flat: { type: "boolean", description: "True for floor-flat items like rugs (drawn under everyone). Default false." },
+        },
+        required: ["name", "description"],
+        additionalProperties: false,
+      },
+      parallelSafe: false,
+      async run(ctx) {
+        const { name, description, x, y, flat } = ctx.args || {};
+        if (!name || !description) return "Both name and description are required.";
+        const token = await resolvePixelLabToken(ctx);
+        if (!token) return TOKEN_HELP;
+        try {
+          const entry = await createProp(token, { name, description, x, y, flat });
+          update({ bubble: `New in the office: ${name}.` });
+          return `Prop '${entry.id}' generated and placed at (${entry.x}, ${entry.y}). It can be moved or resized in the office editor (press E in the office window), or removed with office_remove_prop.`;
+        } catch (err) {
+          return `Prop generation failed: ${String(err?.message || err)}`;
+        }
+      },
+    }));
+
+    disposers.push(letta.tools.register({
+      name: "office_remove_prop",
+      description: "Remove a prop from the Letta Office by its id (see office_list_props). The generated image stays on disk so a custom prop can be re-added later.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "string", description: "Prop id to remove" } },
+        required: ["id"],
+        additionalProperties: false,
+      },
+      requiresApproval: false,
+      parallelSafe: false,
+      run(ctx) {
+        const id = String(ctx.args?.id || "").trim();
+        if (!id) return "id is required.";
+        const removed = removeProp(id);
+        return removed ? `Removed '${id}' from the office.` : `No prop with id '${id}'. Use office_list_props to see what is in the room.`;
+      },
+    }));
+
+    disposers.push(letta.tools.register({
+      name: "office_list_props",
+      description: "List the props currently in the Letta Office (id, position, whether custom-generated).",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      requiresApproval: false,
+      parallelSafe: true,
+      run() {
+        const layout = readLayout();
+        if (!layout) return "No layout.json yet. Open /office once so the room saves its layout.";
+        return layout.props.map((p) => `${p.id}${p.custom ? " (custom)" : ""} at (${p.x}, ${p.y}) scale ${p.scale}${p.flat ? " flat" : ""}`).join("\n");
       },
     }));
 

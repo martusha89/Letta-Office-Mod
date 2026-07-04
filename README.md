@@ -82,15 +82,28 @@ Then just ask your agent something like *"design yourself a body and move into t
 - The page (`office.js`) draws the room and furniture as separate sprites on a canvas, depth-sorts the developer among them, and moves him to the matching station with a short walk animation. It falls back to a self-running demo loop when opened on its own with no agent driving it.
 - Only a coarse station and a short canned status line ever reach the page. No model reasoning is forwarded.
 
-## Rearranging the office
+## Make the office yours
 
-The furniture layout is baked into the code (`CONFIG.props` in `office.js`), so every install starts the same. To rearrange it yourself, open `office.js`, change `editable: false` to `editable: true`, refresh, then:
+The office is editable out of the box, and both you and your agents can change it. The room persists to `layout.json` next to the office files, so your arrangement survives restarts and is shared by every window.
+
+**The editor (humans).** In the office window:
 
 - press `E` to toggle edit mode
-- click a piece and drag to move it, arrow keys to nudge, `+` / `-` to resize
-- press `S` to copy the layout, then paste the new positions into `CONFIG.props`
+- click a piece and drag to move it, arrow keys to nudge (`shift` for big steps), `+` / `-` to resize, `Del` to remove
+- press `G` and describe something new ("arcade cabinet with a glowing purple screen") and PixelLab generates it into the room, ready to drag into place (1 generation, ~30-60s)
+- press `E` again to go back to watching; everything saves automatically
 
-Set `editable` back to `false` when you are done.
+**The prop tools (agents).** The mod registers three more agent-callable tools, so you can just ask your agent to redecorate:
+
+| Tool | What it does |
+|---|---|
+| `office_add_prop` | Generate a pixel-art prop with PixelLab and place it (1 generation) |
+| `office_remove_prop` | Remove a prop by id (the image stays on disk) |
+| `office_list_props` | List everything in the room |
+
+Prop generation uses the same PixelLab token setup as the character forge. Generated props are downloaded into `assets/props/custom/` immediately, PixelLab deletes map-object images from its side after a few hours, so the local copy is the durable one. Custom props are drawn anchored by their visible pixels, so whatever padding the generator adds, they sit properly on the floor.
+
+To reset the room to the default layout, delete `layout.json`.
 
 ## Credits
 
