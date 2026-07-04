@@ -6,6 +6,9 @@ import path from "node:path";
 
 const MOD_ID = "letta-ofiice";
 const DEFAULT_PORT = 47931;
+const PRESENCE_RELAY_PATH = "/presence";
+const PRESENCE_REMOVE_PATH = "/presence/remove";
+const PRESENCE_BODY_LIMIT = 25_000;
 
 let server = null;
 let port = DEFAULT_PORT;
@@ -117,7 +120,7 @@ function broadcastAll() {
   broadcast({ type: "roster", agents: rosterPayload() });
 }
 
-function updateAgent(id, name, patch) {
+function updateAgentLocal(id, name, patch) {
   const p = presenceFor(id, name);
   if (patch.status !== undefined) p.status = patch.status;
   if (patch.station !== undefined) p.station = patch.station;
@@ -126,8 +129,50 @@ function updateAgent(id, name, patch) {
   broadcastAll();
 }
 
-function removeAgent(id) {
+function removeAgentLocal(id) {
   if (roster.delete(String(id || "local"))) broadcastAll();
+}
+
+// Background/fork agents run in their own Letta Code harness process, so their
+// mod instance has a private in-memory roster. If the visible office server is
+// already running in another process, relay presence updates to it over
+// loopback. The server still keeps the authoritative roster and SSE stream.
+async function relayPresence(pathname, payload) {
+  try {
+    await fetch(`http://127.0.0.1:${DEFAULT_PORT}${pathname}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch { /* office is closed or another process owns the port; local state is still updated */ }
+}
+
+function updateAgent(id, name, patch) {
+  updateAgentLocal(id, name, patch);
+  if (!server?.listening) void relayPresence(PRESENCE_RELAY_PATH, { id: String(id || "local"), name, patch });
+}
+
+function removeAgent(id) {
+  removeAgentLocal(id);
+  if (!server?.listening) void relayPresence(PRESENCE_REMOVE_PATH, { id: String(id || "local") });
+}
+
+function readJsonBody(req, res, onJson) {
+  let body = "";
+  req.on("data", (chunk) => {
+    body += chunk;
+    if (body.length > PRESENCE_BODY_LIMIT) req.destroy();
+  });
+  req.on("end", () => {
+    try {
+      onJson(JSON.parse(body || "{}"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"ok":true}');
+    } catch {
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      res.end("bad json");
+    }
+  });
 }
 
 function sweepRoster() {
@@ -689,6 +734,18 @@ const forgeBusy = () => ["creating", "walking", "posing", "downloading"].include
 function createServer() {
   return http.createServer((req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+    if (url.pathname === PRESENCE_RELAY_PATH && req.method === "POST") {
+      readJsonBody(req, res, (payload) => {
+        updateAgentLocal(payload.id, payload.name, payload.patch || {});
+      });
+      return;
+    }
+    if (url.pathname === PRESENCE_REMOVE_PATH && req.method === "POST") {
+      readJsonBody(req, res, (payload) => {
+        removeAgentLocal(payload.id);
+      });
+      return;
+    }
     if (url.pathname === "/state") {
       sendJson(res, { ...state, agents: rosterPayload() });
       return;
