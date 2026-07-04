@@ -503,7 +503,7 @@ async function runForge(token, { name, description, withPoses }) {
       description,
       name,
       mode: "v3",
-      size: 86,
+      size: 88,
       view: "low top-down",
       n_directions: 8,
     });
