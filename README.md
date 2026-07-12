@@ -116,3 +116,7 @@ To reset the room to the default layout, delete `layout.json`.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## About
+
+Built by [Marta Varen](https://aidhd.co). Part of [AIDHD](https://aidhd.co): guides, tools, and open knowledge for human × AI companionship.
